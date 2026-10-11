@@ -2,11 +2,11 @@ widget "nfl" {
   meta {
     owl: 5
     description: "NFL scores and standings from ESPN with team logos: live games first, then finals and this week's upcoming games. Tap for every game and both conferences"
-    version: "1.0"
+    version: "1.6"
     license: "MIT"
     category: "world"
   }
-  requires { pacman: ["curl"] }
+  requires { pacman: ["curl", "jq"] }
   page: 1
   order: 45
   size: 6x4
@@ -30,20 +30,98 @@ widget "nfl" {
 
   state view = "scores"
 
-  let games = scores.events ?? []
+  // Week picker: 18 regular-season weeks, then the playoff rounds (ESPN's
+  // postseason week 4 is the Pro Bowl, so it's skipped). `pick` is an index
+  // into this list, or null for whatever week ESPN calls current.
+  let weeks = flatten([
+    range(1, 19).map(w => { t: 2, w: w, label: "Week ${w}" }),
+    [ { t: 3, w: 1, label: "Wild Card" }, { t: 3, w: 2, label: "Divisional" },
+      { t: 3, w: 3, label: "Conference" }, { t: 3, w: 5, label: "Super Bowl" } ]
+  ])
+  state pick = null
+  let homeIdx = indexOf(weeks.map(k => "${k.t}/${k.w}"), "${scores.season.type}/${scores.week.number}")
+  let home = homeIdx >= 0 ? homeIdx : 0
+  let shown = pick ?? home
+  let wk = weeks[shown]
+
+  // Every game of the season, trimmed to what GameRow reads (ESPN sends 3 MB),
+  // plus the standings after each regular-season week, worked out from the
+  // results since ESPN only serves today's. Picking a week just looks these up:
+  // a source whose URL changes with the week isn't refetched until its next
+  // interval. ESPN's `dates` is a calendar year, so this season is the games of
+  // this year and next tagged with its year; Jan-Feb belong to last year's.
+  // Seeds: division winners 1-4, then wild cards; ties go by win %, wins,
+  // head-to-head, division record (within a division), conference record and
+  // point differential, not the NFL's full tiebreakers.
+  source season = cmd("""
+    y=$(date +%Y); [ "$(date +%-m)" -lt 3 ] && y=$((y - 1))
+    for d in $y $((y + 1)); do
+      curl -fsm 40 "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?dates=$d&limit=1000"
+    done | jq -c -s --argjson y "$y" '
+      {"BUF":"AFC East","MIA":"AFC East","NE":"AFC East","NYJ":"AFC East",
+       "BAL":"AFC North","CIN":"AFC North","CLE":"AFC North","PIT":"AFC North",
+       "HOU":"AFC South","IND":"AFC South","JAX":"AFC South","TEN":"AFC South",
+       "DEN":"AFC West","KC":"AFC West","LV":"AFC West","LAC":"AFC West",
+       "DAL":"NFC East","NYG":"NFC East","PHI":"NFC East","WSH":"NFC East",
+       "CHI":"NFC North","DET":"NFC North","GB":"NFC North","MIN":"NFC North",
+       "ATL":"NFC South","CAR":"NFC South","NO":"NFC South","TB":"NFC South",
+       "ARI":"NFC West","LAR":"NFC West","SF":"NFC West","SEA":"NFC West"} as $div
+      | [.[].events[] | select(.season.year == $y and .season.type >= 2)] as $ev
+      | ([$ev[].competitions[0].competitors[].team | {key: .abbreviation, value: {id, displayName}}] | from_entries) as $tm
+      | [$ev[] | select(.season.type == 2 and .competitions[0].status.type.state == "post") | .week.number as $w
+         | .competitions[0].competitors as $c
+         | ($c[] | select(.homeAway == "away")) as $a | ($c[] | select(.homeAway == "home")) as $h
+         | {w: $w, ta: $a.team.abbreviation, th: $h.team.abbreviation, sa: ($a.score | tonumber), sh: ($h.score | tonumber)}] as $res
+      | def pct(g): if (g | length) == 0 then 0.5 else ((g | map(select(.f > .a)) | length) + 0.5 * (g | map(select(.f == .a)) | length)) / (g | length) end;
+        def rank(useDiv): . as $p | map(. as $x
+            | ($p | map(select(.pct == $x.pct)) | map(.t)) as $tied
+            | .h2h = pct($x.g | map(select(.o as $o | $tied | index($o)))))
+          | sort_by([-.pct, -.w, -.h2h, (if useDiv then -.dpct else 0 end), -.cpct, -.pd, .t]);
+        def table($n): ($res | map(select(.w <= $n))) as $r
+          | [$div | keys[] as $t
+            | [$r[] | if .ta == $t then {o: .th, f: .sa, a: .sh} elif .th == $t then {o: .ta, f: .sh, a: .sa} else empty end] as $g
+            | {t: $t, c: $div[$t][0:3], d: $div[$t], g: $g,
+               w: ($g | map(select(.f > .a)) | length), l: ($g | map(select(.f < .a)) | length), ti: ($g | map(select(.f == .a)) | length),
+               pct: pct($g), cpct: pct($g | map(select($div[.o][0:3] == $div[$t][0:3]))), dpct: pct($g | map(select($div[.o] == $div[$t]))),
+               pd: (($g | map(.f) | add // 0) - ($g | map(.a) | add // 0))}]
+          | [("AFC", "NFC") as $cf | map(select(.c == $cf)) as $conf
+            | ([$conf | group_by(.d)[] | rank(true)[0]] | rank(false)) as $winners
+            | ([$conf[] | select(.t as $t | $winners | map(.t) | index($t) | not)] | rank(false)) as $rest
+            | {abbreviation: $cf, standings: {entries: [($winners + $rest) | to_entries[] | .key as $i | .value
+              | {team: {id: $tm[.t].id, abbreviation: .t, displayName: $tm[.t].displayName}, stats: [
+                  {name: "playoffSeed", value: ($i + 1), displayValue: (($i + 1) | tostring)},
+                  {name: "overall", displayValue: ((.w | tostring) + "-" + (.l | tostring) + (if .ti > 0 then "-" + (.ti | tostring) else "" end))},
+                  {name: "pointDifferential", value: .pd, displayValue: ((if .pd > 0 then "+" else "" end) + (.pd | tostring))}]}]}}];
+        {games: [$ev[] | {id, date, t: .season.type, w: .week.number,
+           competitions: [.competitions[0] | {status: {type: {state: .status.type.state, shortDetail: .status.type.shortDetail}},
+             competitors: [.competitors[] | {homeAway, score, winner, team: {abbreviation: .team.abbreviation}}]}]}],
+         standings: ([range(1; 19) | {key: tostring, value: table(.)}] | from_entries)}
+    '
+  """) every 30m json timeout 90s
+
+  // The header's live count is always about now, whichever week is shown.
+  let liveNow = (scores.events ?? []).filter(g => g.competitions[0].status.type.state == 'in')
+  let loading = shown != home && season == null
+  let games = (shown == home ? scores.events : (season.games ?? []).filter(g => g.t == wk.t && g.w == wk.w)) ?? []
   let live = games.filter(g => g.competitions[0].status.type.state == 'in')
-  let done = games.filter(g => g.competitions[0].status.type.state == 'post').reverse()
-  let next = games.filter(g => g.competitions[0].status.type.state == 'pre')
-  let cap = clamp((rows ?? 4) * 3 - 2, 5, 14)
-  let picked = flatten([live.take(3), done.take(3), next.take(cap)]).take(cap)
+  // The whole week: live, then finals newest first, then upcoming by kickoff.
+  // ESPN's own order is jumbled (Thursday's game comes near the end).
+  let done = games.filter(g => g.competitions[0].status.type.state == 'post').sortBy(g => g.date).reverse()
+  let next = games.filter(g => g.competitions[0].status.type.state == 'pre').sortBy(g => g.date)
+  let ordered = flatten([live, done, next])
 
   let confs = table.children ?? []
   let flat = (table.standings.entries ?? []).sortBy(e => (e.stats.find(s => s.name == 'playoffSeed') ?? {}).value ?? 999)
   let confs2 = count(confs) ? confs : [ { name: "NFL", standings: { entries: flat } } ]
+  // The full screen shows the standings as they were after a past week picked
+  // there; today's week, later weeks and the playoffs show ESPN's own.
+  let past = wk.t == 2 && shown < home && get(season.standings ?? {}, str(wk.w), null) != null
+  let shownConfs = past ? get(season.standings, str(wk.w), null) : confs2
 
   component Badge(t, px = 18) {
     let a = lower(t.team.abbreviation ?? '')
-    if t.team.abbreviation {
+    // Wait for the logo download to finish, or a first run draws missing files.
+    if t.team.abbreviation && logos.ready {
       Image { src: "~/.cache/nfl-logos/${a == 't' ? 'ten' : a}.png"; size: px; fit: contain }
     }
   }
@@ -96,11 +174,31 @@ widget "nfl" {
 
   component TeamRow(t) {
     let diff = (t.stats.find(s => s.name == 'pointDifferential') ?? {}).value ?? 0
+    // Full "Kansas City Chiefs" where there's room, the abbreviation on a narrow tile.
+    let vw = max(max(screenWidth ?? 0, tileWidth ?? 0), 240)
+    let wide = vw >= 280
     Row {
       Text { text: (t.stats.find(s => s.name == 'playoffSeed') ?? {}).displayValue ?? '–'; width: 24; style: small; color: muted }
-      Text { text: t.team.abbreviation; weight: 1; style: small }
+      Badge { t: t; px: wide ? 18 : 14 }
+      Text { text: wide ? t.team.displayName ?? t.team.abbreviation : t.team.abbreviation; weight: 1; style: small; maxLines: 1 }
       Text { text: (t.stats.find(s => s.name == 'overall') ?? {}).displayValue ?? '–'; width: 46; style: small; bold: true; align: end }
       Text { text: (t.stats.find(s => s.name == 'pointDifferential') ?? {}).displayValue ?? '–'; width: 42; style: small; align: end; color: diff > 0 ? green : diff < 0 ? red : muted }
+    }
+  }
+
+  // ‹ Week 5 ›: the arrows step through the season; tapping the name goes back
+  // to the current week. Rows can't scroll sideways, so it's a stepper.
+  component WeekPicker() {
+    Row {
+      align: center
+      Button { text: "‹"; width: 48; color: shown > 0 ? foreground : muted; onTap: pick = max(shown - 1, 0) }
+      Text {
+        text: shown == home ? "${wk.label} · now" : wk.label
+        weight: 1; align: center; style: small; bold: true
+        color: shown == home ? accent : foreground
+        onTap: pick = null
+      }
+      Button { text: "›"; width: 48; color: shown < count(weeks) - 1 ? foreground : muted; onTap: pick = min(shown + 1, count(weeks) - 1) }
     }
   }
 
@@ -109,8 +207,8 @@ widget "nfl" {
   Column {
     Row {
       Text { text: "NFL"; style: title; weight: 1 }
-      if count(live) > 0 {
-        Text { text: "${count(live)} live"; style: small; color: accent; width: 60; align: end; bold: true }
+      if count(liveNow) > 0 {
+        Text { text: "${count(liveNow)} live"; style: small; color: accent; width: 60; align: end; bold: true }
       } else {
         Text { text: fmtTime(now, "EEE d"); style: small; color: muted; width: 60; align: end }
       }
@@ -119,21 +217,26 @@ widget "nfl" {
       Button { text: "scores"; weight: 1; color: view == "scores" ? accent : muted; onTap: view = "scores" }
       Button { text: "standings"; weight: 1; color: view == "standings" ? accent : muted; onTap: view = "standings" }
     }
+    if view == "scores" { WeekPicker { } }
     Column {
       weight: 1
       scroll: true
       if view == "scores" {
-        if count(picked) == 0 {
-          Text { text: "no games this week"; style: small; color: muted }
+        if loading {
+          Text { text: "loading ${wk.label}…"; style: small; color: muted }
         } else {
-          for g in picked key g.id { GameRow { g: g } }
+          if count(ordered) == 0 {
+            Text { text: "no games this week"; style: small; color: muted }
+          } else {
+            for g in ordered key g.id { GameRow { g: g } }
+          }
         }
       } else {
         for c in confs2 {
           Text { text: c.abbreviation ?? c.name; style: label; color: muted }
           for t, i in (c.standings.entries ?? []).sortBy(e => (e.stats.find(s => s.name == 'playoffSeed') ?? {}).value ?? 999) key t.team.id {
             let seed = (t.stats.find(s => s.name == 'playoffSeed') ?? {}).value
-            if i > 0 && seed == 8 { Box { height: 7; fill: width  Row { width: 32; height: 1; background: border } } }
+            if i > 0 && seed == 8 { Box { height: 9; fill: width; padding: [12, 0]; align: center  Row { fill: width; height: 1; background: border } } }
             TeamRow { t: t }
           }
         }
@@ -146,13 +249,14 @@ widget "nfl" {
     Column {
       scroll: true
       Text { text: "scores"; style: title }
-      for g in games key g.id { GameRow { g: g } }
-      Text { text: "standings"; style: title }
-      for c in confs2 {
+      WeekPicker { }
+      for g in ordered key g.id { GameRow { g: g } }
+      Text { text: past ? "standings after ${wk.label}" : "standings"; style: title }
+      for c in shownConfs {
         Text { text: c.abbreviation ?? c.name; style: label; color: muted }
         for t, i in (c.standings.entries ?? []).sortBy(e => (e.stats.find(s => s.name == 'playoffSeed') ?? {}).value ?? 999) key t.team.id {
           let seed = (t.stats.find(s => s.name == 'playoffSeed') ?? {}).value
-          if i > 0 && seed == 8 { Box { height: 7; fill: width  Row { width: 32; height: 1; background: border } } }
+          if i > 0 && seed == 8 { Box { height: 9; fill: width; padding: [12, 0]; align: center  Row { fill: width; height: 1; background: border } } }
           TeamRow { t: t }
         }
       }
